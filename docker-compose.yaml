@@ -1,0 +1,13 @@
+#version: "3.3"
+
+services:
+  scenedataset:
+    # you can change this to whatever you want.
+    container_name: scenedataset
+    build:
+      context: ./
+      dockerfile: ./Dockerfile
+    # volumes:
+    #   - "./data:/SceneDataset/data"
+    #   - "./notebooks:/SceneDataset/notebooks"
+    tty: true
