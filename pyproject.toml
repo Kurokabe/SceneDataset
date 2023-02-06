@@ -12,16 +12,20 @@ decord = ">=0.6.0"
 loguru = ">=0.6.0"
 ffmpeg = ">=1.4"
 scenedetect = ">=0.6.1"
-torch = "^1.13.1"
-opencv-python = "^4.7.0.68"
-ffmpeg-python = "^0.2.0"
+torch = ">=1.13.1"
+opencv-python = ">=4.7.0.68"
+ffmpeg-python = ">=0.2.0"
+torchmetrics = ">=0.11.1"
 
 [tool.poetry.dev-dependencies]
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^7.2.1"
-pytest-cov = "^4.0.0"
-ipykernel = "^6.20.2"
+pytest = ">=7.2.1"
+pytest-cov = ">=4.0.0"
+ipykernel = ">=6.20.2"
+black = {version = ">=23.1.0", allow-prereleases = true}
+ipywidgets = "^8.0.4"
+torchvision = "^0.14.1"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

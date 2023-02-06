@@ -1,16 +1,27 @@
-from typing import Optional, Callable, Dict, Literal, Tuple
-import os
-import ffmpeg
-from typing import List
-from torch.utils.data import Dataset
-from decord import VideoReader, cpu
-from glob import glob
-from loguru import logger
-from scenedetect import SceneManager, open_video, SceneDetector
-import json
 import dataclasses
+import json
+import os
 from dataclasses import dataclass
+from glob import glob
+from typing import Callable, Dict, List, Literal, Optional, Tuple
+
 import decord
+import ffmpeg
+import torch
+from decord import VideoReader, cpu
+from loguru import logger
+from scenedetect import SceneDetector, SceneManager, open_video
+from torch.utils.data import Dataset
+
+# from torchmetrics import (
+#     MeanAbsoluteError,
+#     MeanSquaredError,
+#     StructuralSimilarityIndexMeasure,
+# )
+from ignite.engine import Engine
+from ignite.metrics import SSIM, MeanSquaredError, MeanAbsoluteError
+
+from tqdm.auto import tqdm
 
 decord.bridge.set_bridge("torch")
 
@@ -27,6 +38,7 @@ class Scene:
     start: int
     end: int
     video_path: str
+    images_to_load: Optional[List[int]] = None
 
     def __len__(self):
         return self.end - self.start
@@ -49,6 +61,8 @@ class SceneDataset(Dataset):
         show_progress: bool = False,
         min_max_len: Optional[Tuple[int]] = None,
         detector: Literal["content", "threshold", "adaptive"] = "content",
+        duplicate_threshold: Optional[float] = None,
+        duplicate_method: Literal["mse", "mae", "ssim"] = "ssim",
         **kwargs,
     ):
         """Dataset that will load scenes on the fly from a list of videos. The scenes are detected using the PySceneDetect library https://scenedetect.com/projects/Manual/en/latest/index.html.
@@ -59,6 +73,8 @@ class SceneDataset(Dataset):
             show_progress (bool, optional): Whether to show progress or not when detecting scenes with PySceneDetect. Defaults to False.
             min_max_len (Optional[Tuple[int]], optional): Minimum and maximum length of the scenes. If specified, must be a tuple of two values, the minimal scene length and maximal scene length. Scenes longer that max scene length will be splitted into a length that is between these two values.  Defaults to None.
             detector (Literal[&quot;content&quot;, &quot;threshold&quot;, &quot;adaptive&quot;], optional): Method used to detect the scenes. Refer to the following link for more details about detectors: https://scenedetect.com/projects/Manual/en/latest/cli/detectors.html. Defaults to "content".
+            duplicate_threshold (Optional[float], optional): If specified, will remove duplicate scenes. The threshold is the minimum distance between two scenes to consider them as duplicates. Defaults to None.
+            duplicate_method (Literal[&quot;mse&quot;, &quot;mae&quot;, &quot;ssim&quot;], optional): Method used to compute the distance between two scenes. Defaults to "ssim". Only used if duplicate_threshold is specified.
             **kwargs: Keyword arguments passed to the detector. Depends on which detector is used. Refer to the following link for more details about detectors: https://scenedetect.com/projects/Manual/en/latest/cli/detectors.html.
             The available arguments when detector is set to "content" are:
                 - threshold=27.0
@@ -91,6 +107,9 @@ class SceneDataset(Dataset):
         self.video_paths = self._get_video_paths(paths, recursive)
         self.transform = transform
         self.min_max_len = min_max_len
+        self.duplicate_threshold = duplicate_threshold
+        self.default_evaluator = self.load_duplicate_method(duplicate_method)
+        self.duplicate_method = duplicate_method
 
         self.detector_type = detector
         self.detector_kwargs = kwargs
@@ -108,6 +127,29 @@ class SceneDataset(Dataset):
         # TODO : add a shuffle parameter
         # if True:
         #     random.shuffle(self.scenes)
+
+    def load_duplicate_method(self, method: Literal["mse", "mae", "ssim"]) -> Callable:
+        """Load the method used to compute the distance between two scenes.
+        Args:
+            method (Literal[&quot;mse&quot;, &quot;mae&quot;, &quot;ssim&quot;]): Method used to compute the distance between two scenes.
+        Returns:
+            Callable: Method used to compute the distance between two scenes.
+        """
+
+        def eval_step(engine, batch):
+            return batch
+
+        default_evaluator = Engine(eval_step)
+
+        if method == "mse":
+            metric = MeanSquaredError()
+        elif method == "mae":
+            metric = MeanAbsoluteError()
+        elif method == "ssim":
+            metric = SSIM(data_range=1.0)
+
+        metric.attach(default_evaluator, "metric")
+        return default_evaluator
 
     def load_detector(
         self, detector: Literal["content", "threshold", "adaptive"], **kwargs
@@ -189,8 +231,62 @@ class SceneDataset(Dataset):
 
             self.update_mapping()
 
+        if self.duplicate_threshold is not None:
+            logger.info("Removing duplicate scenes...")
+            scenes = self.remove_duplicate_from_scenes(scenes)
+
         cut_scenes = self.cut_scenes_if_necessary(scenes)
         return cut_scenes
+
+    def remove_duplicate_from_scenes(self, scenes: List[Scene]) -> List[Scene]:
+        """Remove duplicate scenes.
+        Args:
+            scenes (List[Scene]): List of scenes to remove duplicates from.
+        Returns:
+            List[Scene]: List of scenes without duplicates.
+        """
+        without_duplicates = []
+        for scene in scenes:
+            if scene.images_to_load is None:
+                scene.images_to_load = self.get_images_to_load(scene)
+
+            if (
+                len(scene.images_to_load) >= 1
+            ):  # 1 because at least one image is always present
+                without_duplicates.append(scene)
+        return without_duplicates
+
+    def get_images_to_load(self, scene: Scene) -> List[int]:
+        """Get the images to load from a scene.
+        Args:
+            scene (Scene): Scene to get the images from.
+        Returns:
+            List[int]: List of images to load.
+        """
+        frames = self.load_frames(scene)
+
+        # state = default_evaluator.run([[torch.zeros((1, 3, 100, 100)), torch.zeros((1, 3, 100, 100))]])
+        # ssim(torch.rand((1, 3, 256, 512)), torch.rand((1, 3, 256, 512)))
+        # ssim(current_frame, next_frame)
+
+        frames = frames.permute(0, 3, 1, 2)
+        frames = frames.float() / 255.0
+        frames_to_load = []
+        for i in tqdm(
+            range(len(frames) - 1), desc="Loading scenes to find duplicates..."
+        ):
+            current_frame = frames[i : i + 1]
+            next_frame = frames[i + 1 : i + 2]
+
+            difference = self.default_evaluator.run(
+                [[current_frame, next_frame]]
+            ).metrics["metric"]
+            if self.duplicate_method == "ssim":
+                difference = 1 - difference
+            if difference > self.duplicate_threshold:
+                frames_to_load.append(i)
+        frames_to_load.append(len(frames) - 1)
+        return frames_to_load
 
     def save_scenes(self, scenes: List[Scene], save_path: str):
         """Save the scenes info in a json file.
@@ -294,7 +390,6 @@ class SceneDataset(Dataset):
         return lowest_id
 
     def cut_scene(self, scene: Scene, length: int) -> Scene:
-
         """Cut the scene into the specified length. If the scene cannot be cut perfectly into the specified length, the last scene will be shorter or longer than the others.
         Yields:
             Scene: Subscene of the scene after cutting.
@@ -308,7 +403,7 @@ class SceneDataset(Dataset):
                 end = (i + 1) * length
                 if len(scene) - end < length:
                     end = len(scene)
-                yield Scene(start, end, scene.video_path)
+                yield Scene(scene.start + start, scene.start + end, scene.video_path)
 
     def retrieve_video_to_scene_list(self, root: str) -> Dict[str, str]:
         """Retrieve the mapping between the video paths and the scene list files."""
@@ -321,7 +416,6 @@ class SceneDataset(Dataset):
         return video_to_scene_list
 
     def _get_video_paths(self, paths: List[str], recursive: bool) -> List[str]:
-
         """Find all the video files in the paths. If a path is a folder, it will search recursively inside the folder if recursive is set to True.
         Args:
             paths (List[str]): List of paths to search for videos.
@@ -373,11 +467,25 @@ class SceneDataset(Dataset):
 
     def __getitem__(self, idx: int):
         scene = self.scenes[idx]
-        vr = VideoReader(scene.video_path)
-        frames = vr.get_batch(
-            range(scene.start, scene.end, 3)
-        )  # TODO set 3 as a parameter
+        # vr = VideoReader(scene.video_path)
+        # frames = vr.get_batch(
+        #     range(scene.start, scene.end, 3)
+        # )  # TODO set 3 as a parameter
+        frames = self.load_frames(scene)
         # frames = frames.to(dtype=torch.float) / 255
         if self.transform:
             frames = self.transform(frames)
         return frames
+
+    def load_frames(self, scene: Scene) -> torch.Tensor:
+        """Load the frames of a scene.
+        Args:
+            scene (Scene): Scene to load.
+        Returns:
+            torch.Tensor: Tensor of shape (n_frames, height, width, channels).
+        """
+        vr = VideoReader(scene.video_path)
+        if scene.images_to_load is not None:
+            return vr.get_batch(scene.images_to_load)
+
+        return vr.get_batch(range(scene.start, scene.end))
