@@ -44,10 +44,14 @@ class Scene:
         return self.end - self.start
 
     def __repr__(self):
-        return f"Scene({self.start}, {self.end}, {self.video_path})"
+        return (
+            f"Scene({self.start}, {self.end}, {self.video_path}, {self.images_to_load})"
+        )
 
     def __str__(self):
-        return f"Scene({self.start}, {self.end}, {self.video_path})"
+        return (
+            f"Scene({self.start}, {self.end}, {self.video_path}, {self.images_to_load})"
+        )
 
 
 class SceneDataset(Dataset):
@@ -235,8 +239,9 @@ class SceneDataset(Dataset):
             logger.info("Removing duplicate scenes...")
             scenes = self.remove_duplicate_from_scenes(scenes)
 
-        cut_scenes = self.cut_scenes_if_necessary(scenes)
-        return cut_scenes
+        return scenes
+        # cut_scenes = self.cut_scenes_if_necessary(scenes)
+        # return cut_scenes
 
     def remove_duplicate_from_scenes(self, scenes: List[Scene]) -> List[Scene]:
         """Remove duplicate scenes.
@@ -246,12 +251,12 @@ class SceneDataset(Dataset):
             List[Scene]: List of scenes without duplicates.
         """
         without_duplicates = []
-        for scene in scenes:
+        for scene in scenes[:3]:
             if scene.images_to_load is None:
                 scene.images_to_load = self.get_images_to_load(scene)
 
             if (
-                len(scene.images_to_load) >= 1
+                len(scene.images_to_load) > 1
             ):  # 1 because at least one image is always present
                 without_duplicates.append(scene)
         return without_duplicates
