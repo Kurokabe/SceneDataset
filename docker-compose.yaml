@@ -9,3 +9,11 @@ services:
     volumes:
       - "./:/SceneDataset"
     tty: true
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
