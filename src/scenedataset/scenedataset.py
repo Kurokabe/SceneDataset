@@ -253,8 +253,6 @@ class SceneDataset(Dataset):
 
             self.update_mapping()
 
-        scenes = scenes[:20]
-
         if self.duplicate_threshold is not None:
             scenes = self.remove_duplicate_from_scenes(scenes)
             save_path = os.path.join(
