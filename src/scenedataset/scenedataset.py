@@ -364,17 +364,17 @@ class SceneDataset(Dataset):
             scenes (List[Scene]): List of scenes to save.
             save_path (str): Path where the scenes will be saved.
         """
-        saved_scenes = self.load_precomputed_scenes(save_path)
+        try:
+            saved_scenes = self.load_precomputed_scenes(save_path)
 
-        if str(saved_scenes) != str(scenes):
-            print("saved_scenes", str(saved_scenes)[:100])
-            print("scenes      ", str(scenes)[:100])
+            if str(saved_scenes) == str(scenes):
+                logger.info(f"Scene list file {save_path} already up to date.")
+                raise FileNotFoundError
 
+        except FileNotFoundError:
             logger.info(f"Updating scene list file {save_path}...")
             with open(save_path, "w") as f:
                 json.dump(scenes, f, cls=EnhancedJSONEncoder)
-        else:
-            logger.info(f"Scene list file {save_path} already up to date.")
 
     def update_mapping(self):
         """Update the mapping between the video paths and the scene list files."""
