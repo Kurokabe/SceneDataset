@@ -1,18 +1,21 @@
 import dataclasses
+import gc
 import json
 import os
+import random
 from dataclasses import dataclass
 from glob import glob
-from typing import Callable, Dict, List, Literal, Optional, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import decord
 import ffmpeg
 import torch
 from decord import VideoReader, cpu
+from joblib import delayed
+from scenedataset.utils import ProgressParallel
 from loguru import logger
 from scenedetect import SceneDetector, SceneManager, open_video
 from torch.utils.data import Dataset
-
 from tqdm.auto import tqdm
 
 decord.bridge.set_bridge("torch")
@@ -63,6 +66,10 @@ class SceneDataset(Dataset):
         detector: Literal["content", "threshold", "adaptive"] = "content",
         duplicate_threshold: Optional[float] = None,
         duplicate_metric: Literal["mse", "mae", "lpips"] = "lpips",
+        device: Union[torch.device, str] = "cpu",
+        initial_shuffle: bool = False,
+        root_dir: Optional[str] = None,
+        num_workers: int = 1,
         **kwargs,
     ):
         """Dataset that will load scenes on the fly from a list of videos. The scenes are detected using the PySceneDetect library https://scenedetect.com/projects/Manual/en/latest/index.html.
@@ -75,6 +82,10 @@ class SceneDataset(Dataset):
             detector (Literal[&quot;content&quot;, &quot;threshold&quot;, &quot;adaptive&quot;], optional): Method used to detect the scenes. Refer to the following link for more details about detectors: https://scenedetect.com/projects/Manual/en/latest/cli/detectors.html. Defaults to "content".
             duplicate_threshold (Optional[float], optional): If specified, will remove duplicate scenes. The threshold is the minimum distance between two scenes to consider them as duplicates. Defaults to None.
             duplicate_method (Literal[&quot;mse&quot;, &quot;mae&quot;, &quot;ssim&quot;], optional): Method used to compute the distance between two scenes. Defaults to "ssim". Only used if duplicate_threshold is specified.
+            device (Union[torch.device, str], optional): Device used to compute the distance between two scenes. Defaults to "cpu". Only used if duplicate_threshold is specified.
+            initial_shuffle (bool, optional): Whether to shuffle the dataset at initialization or not. Defaults to False.
+            root_dir (Optional[str], optional): Root directory where the scenes informations will be saved. If None, will use `~/.scene_dataset` directory. Defaults to None.
+            num_workers (int, optional): Number of workers used to detect scenes. Useful when `paths` contains multiple videos. If `num_workers` is `-1`, all cpus will be used. Defaults to 1.
             **kwargs: Keyword arguments passed to the detector. Depends on which detector is used. Refer to the following link for more details about detectors: https://scenedetect.com/projects/Manual/en/latest/cli/detectors.html.
             The available arguments when detector is set to "content" are:
                 - threshold=27.0
@@ -108,8 +119,11 @@ class SceneDataset(Dataset):
         self.transform = transform
         self.min_max_len = min_max_len
         self.duplicate_threshold = duplicate_threshold
+        self.device = self._convert_device(device)
         self.metric = self.init_metric(duplicate_metric)
         self.duplicate_metric = duplicate_metric
+        self.root_dir = self._convert_root_dir(root_dir)
+        self.num_workers = num_workers
 
         self.detector_type = detector
         self.detector_kwargs = kwargs
@@ -124,9 +138,22 @@ class SceneDataset(Dataset):
         ] = self.retrieve_video_to_scene_list(self.scene_list_dir)
 
         self.scenes = self.retrieve_scenes(self.video_paths)
-        # TODO : add a shuffle parameter
-        # if True:
-        #     random.shuffle(self.scenes)
+        self._clean_metric()
+
+        if initial_shuffle:
+            random.shuffle(self.scenes)
+
+    def _convert_root_dir(self, root_dir: Optional[str]) -> str:
+        """Convert the root_dir to a valid path."""
+        if root_dir is None:
+            return os.path.join(os.path.expanduser("~"), ".scene_dataset")
+        return root_dir
+
+    def _convert_device(self, device: Union[str, torch.device]) -> torch.device:
+        """Convert a device to a torch.device."""
+        if isinstance(device, str):
+            return torch.device(device)
+        return device
 
     def compute_difference(
         self, current_frame: torch.tensor, next_frame: torch.tensor
@@ -138,6 +165,8 @@ class SceneDataset(Dataset):
         Returns:
             float: Difference between the two frames.
         """
+        current_frame = current_frame.to(self.device)
+        next_frame = next_frame.to(self.device)
         if self.duplicate_metric == "lpips":
             # frames are between 0 and 1, scale between -1 and 1
             return self.metric(current_frame * 2 - 1, next_frame * 2 - 1).item()
@@ -155,17 +184,25 @@ class SceneDataset(Dataset):
         if method == "mae":
             from torch.nn import L1Loss
 
-            return L1Loss()
+            return L1Loss().to(self.device)
         elif method == "mse":
             from torch.nn import MSELoss
 
-            return MSELoss()
+            return MSELoss().to(self.device)
         elif method == "lpips":
             from lpips import LPIPS
 
-            return LPIPS(net="vgg")
+            return LPIPS(net="vgg").to(self.device)
         else:
             raise ValueError(f"Method {method} not supported")
+
+    def _clean_metric(self):
+        """Release the memory used by the metric if it is on the GPU."""
+        if self.device.type == "cuda":
+            self.metric.cpu()
+            del self.metric
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def load_detector(
         self, detector: Literal["content", "threshold", "adaptive"], **kwargs
@@ -198,8 +235,7 @@ class SceneDataset(Dataset):
             str: Path where the scene list files will be stored.
         """
         scene_list_dir = os.path.join(
-            os.path.expanduser("~"),
-            ".scene_dataset",
+            self.root_dir,
             "_".join(str(val) for val in detector_params.values()),
         )
         if self.duplicate_threshold:
@@ -222,10 +258,14 @@ class SceneDataset(Dataset):
         Returns:
             List[Scene]: List of scenes holding the start and end frame of each scene.
         """
-        scenes = []
-        for video_path in video_paths:
-            scenes.extend(self.retrieve_scenes_from_video(video_path))
-        return scenes
+        # scenes = []
+        # for video_path in video_paths:
+        #     scenes.extend(self.retrieve_scenes_from_video(video_path))
+
+        return ProgressParallel(n_jobs=self.num_workers)(
+            delayed(self.retrieve_scenes_from_video)(video_path)
+            for video_path in video_paths
+        )
 
     def retrieve_scenes_from_video(
         self,
@@ -245,26 +285,23 @@ class SceneDataset(Dataset):
             )
         else:
             scenes = self.detect_scenes(video_path)
-            save_path = os.path.join(
-                self.scene_list_dir, f"{video_path.replace('/', '_')}.json"
-            )
-            self.save_scenes(scenes, save_path)
-            self.mapping_video_path_to_scene_file[video_path] = save_path
-
-            self.update_mapping()
+            self.save_scenes_in_cache(scenes, video_path)
 
         if self.duplicate_threshold is not None:
             scenes = self.remove_duplicate_from_scenes(scenes)
-            save_path = os.path.join(
-                self.scene_list_dir, f"{video_path.replace('/', '_')}.json"
-            )
-            self.save_scenes(scenes, save_path)
-            self.mapping_video_path_to_scene_file[video_path] = save_path
-
-            self.update_mapping()
+            self.save_scenes_in_cache(scenes, video_path)
 
         cut_scenes = self.cut_scenes_if_necessary(scenes)
         return cut_scenes
+
+    def save_scenes_in_cache(self, scenes: List[Scene], video_path: str):
+        save_path = os.path.join(
+            self.scene_list_dir, f"{video_path.replace('/', '_')}.json"
+        )
+        self.save_scenes(scenes, save_path)
+        self.mapping_video_path_to_scene_file[video_path] = save_path
+
+        self.update_mapping()
 
     def get_save_folder(self):
         """Get the folder where the dataset will be saved.
@@ -281,8 +318,9 @@ class SceneDataset(Dataset):
             List[Scene]: List of scenes without duplicates.
         """
         without_duplicates = []
-        logger.info("Removing duplicates...")
-        for scene in tqdm(scenes, desc="Removing duplicates..."):
+        for scene in tqdm(
+            scenes, desc=f"Removing duplicates from scene {scenes[0].video_path}..."
+        ):
             if scene.images_to_load is None:
                 scene.images_to_load = self.get_images_to_load(scene)
 
@@ -301,10 +339,6 @@ class SceneDataset(Dataset):
         """
         frames = self.load_frames(scene)
 
-        # state = default_evaluator.run([[torch.zeros((1, 3, 100, 100)), torch.zeros((1, 3, 100, 100))]])
-        # ssim(torch.rand((1, 3, 256, 512)), torch.rand((1, 3, 256, 512)))
-        # ssim(current_frame, next_frame)
-
         frames = frames.permute(0, 3, 1, 2)
         frames = frames.float() / 255.0
         frames_to_load = []
@@ -312,9 +346,10 @@ class SceneDataset(Dataset):
         current_frame = frames[0:1]
         frames_to_load.append(scene.start)
 
-        for i in tqdm(
-            range(1, len(frames)), desc="Computing difference between frames..."
-        ):
+        # logger.info(
+        #     f"Computing difference between frames for scene {scene.video_path}..."
+        # )
+        for i in range(1, len(frames)):
             next_frame = frames[i : i + 1]
 
             difference = self.compute_difference(current_frame, next_frame)
@@ -329,8 +364,17 @@ class SceneDataset(Dataset):
             scenes (List[Scene]): List of scenes to save.
             save_path (str): Path where the scenes will be saved.
         """
-        with open(save_path, "w") as f:
-            json.dump(scenes, f, cls=EnhancedJSONEncoder)
+        saved_scenes = self.load_precomputed_scenes(save_path)
+
+        if str(saved_scenes) != str(scenes):
+            print("saved_scenes", str(saved_scenes)[:100])
+            print("scenes      ", str(scenes)[:100])
+
+            logger.info(f"Updating scene list file {save_path}...")
+            with open(save_path, "w") as f:
+                json.dump(scenes, f, cls=EnhancedJSONEncoder)
+        else:
+            logger.info(f"Scene list file {save_path} already up to date.")
 
     def update_mapping(self):
         """Update the mapping between the video paths and the scene list files."""
@@ -341,6 +385,22 @@ class SceneDataset(Dataset):
             json.dump(self.mapping_video_path_to_scene_file, f)
 
     def load_precomputed_scenes(self, scene_file: str) -> List[Scene]:
+        # TODO try except like :
+        # attempts = 0
+        # max_attempts = 20
+        # while attempts < max_attempts:
+        #     try:
+        #         with open(scene_file, "r") as f:
+        #             scenes = json.load(f)
+        #         break
+        #     except json.decoder.JSONDecodeError:
+        #         attempts += 1
+        #         time.sleep(1)
+        #         if attempts >= max_attempts:
+        #             logger.error(
+        #                 f"Error while loading {scene_file}. Please delete the file and try again."
+        #             )
+        #             raise
         with open(scene_file, "r") as f:
             scenes = json.load(f)
 
@@ -476,16 +536,6 @@ class SceneDataset(Dataset):
             for file_path in glob(path, recursive=recursive):
                 if self.check_if_video(file_path):
                     video_paths.append(file_path)
-
-            # if os.path.isfile(path):
-            #     # File
-            # else:
-            #     logger.info(f"Finding video files inside {path} ...")
-            #     # Folder
-            #     for file_path in glob(os.path.join(path, "**"), recursive=recursive):
-            #         if os.path.isfile(file_path):
-            #             if self.check_if_video(file_path):
-            #                 video_paths.append(file_path)
 
         video_paths = list(map(os.path.abspath, video_paths))
         logger.info(f"Found {len(video_paths)} videos")
