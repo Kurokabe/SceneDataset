@@ -20,6 +20,8 @@ from tqdm.auto import tqdm
 
 decord.bridge.set_bridge("torch")
 
+import multiprocessing as mp
+
 
 class EnhancedJSONEncoder(json.JSONEncoder):
     def default(self, o):
@@ -124,6 +126,11 @@ class SceneDataset(Dataset):
         self.duplicate_metric = duplicate_metric
         self.root_dir = self._convert_root_dir(root_dir)
         self.num_workers = num_workers
+
+        if self.device.type == "cuda":
+            import torch.multiprocessing as mp
+
+            mp.set_start_method("spawn", force=True)
 
         self.detector_type = detector
         self.detector_kwargs = kwargs
@@ -258,14 +265,9 @@ class SceneDataset(Dataset):
         Returns:
             List[Scene]: List of scenes holding the start and end frame of each scene.
         """
-        # scenes = []
-        # for video_path in video_paths:
-        #     scenes.extend(self.retrieve_scenes_from_video(video_path))
-
-        return ProgressParallel(n_jobs=self.num_workers)(
-            delayed(self.retrieve_scenes_from_video)(video_path)
-            for video_path in video_paths
-        )
+        with mp.Pool(processes=self.num_workers) as pool:
+            scenes = pool.map(self.retrieve_scenes_from_video, video_paths)
+        return scenes
 
     def retrieve_scenes_from_video(
         self,
