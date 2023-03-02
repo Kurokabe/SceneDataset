@@ -371,6 +371,8 @@ class SceneDataset(Dataset):
 
             if str(saved_scenes) == str(scenes):
                 logger.info(f"Scene list file {save_path} already up to date.")
+
+            else:
                 raise FileNotFoundError
 
         except FileNotFoundError:

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "scenedataset"
-version = "0.2.2"
+version = "0.2.3"
 description = "PyTorch dataset which uses PySceneDetect to split videos into scenes"
 authors = ["Farid Abdalla"]
 license = "BSD 3-Clause"
