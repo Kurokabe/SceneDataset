@@ -74,7 +74,7 @@ Interested in contributing? Check out the contributing guidelines. Please note t
 
 ## License
 
-`scenedataset` was created by Farid Abdalla. It is licensed under the terms of the BSD 3-Clause license.
+`scenedataset` was created by Alain Gysi. It is licensed under the terms of the BSD 3-Clause license.
 
 ## Credits
 
